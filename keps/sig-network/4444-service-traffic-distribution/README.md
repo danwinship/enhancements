@@ -13,6 +13,7 @@
     - [Story 1](#story-1)
     - [Story 2](#story-2)
     - [Story 3](#story-3)
+    - [Story 4 (DNS)](#story-4-dns)
   - [Notes/Constraints/Caveats](#notesconstraintscaveats)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
@@ -266,6 +267,18 @@ NOTE: Implementations reserve the right to refine the behavior associated with
   implementation. This simplifies their deployment process and reduces the
   complexity of managing cross-cluster applications.
 
+#### Story 4 (DNS)
+
+* **Requirement:** As a cluster administrator, I plan to deploy CoreDNS so that there
+  is an endpoint on every node, and I want clients to preferentially connect to the
+  endpoint on their own node, to reduce latency. I'm not worried about CoreDNS
+  endpoints becoming overloaded by unbalanced traffic distribution, because "1
+  endpoint per node" is substantially more replicas than the service "needs" anyway.
+* **Solution:** Set `trafficDistribution: PreferClose`
+* **Effect:** The Kubernetes implementation will recognize that the DNS service is
+  deployed in a way that supports "prefer same node" traffic distribution, and behave
+  accordingly.
+
 ### Notes/Constraints/Caveats
 
 This proposal is our third attempt at an API revolving around such a
@@ -311,14 +324,29 @@ the value configured for `trafficDistribution`
 * This leverages existing implementation, requiring no major changes.
 
 #### `PreferClose`
-* **Meaning:** Attempts to route traffic to endpoints within the same zone as
-  the client. If no endpoints are available within the zone, traffic would be
-  routed to other zones.
+* **Meaning:**
+  * Attempts to route traffic to endpoints within the same zone as the client. If no
+    endpoints are available within the zone, traffic would be routed to other zones.
+  * If the Service has endpoints that are part of a DaemonSet deployed to all nodes,
+    then it attempts to route traffic to endpoints on the same node as the client. If
+    no endpoints are available on the same node, traffic would be routed to other
+    nodes (though still preferring the same zone, if relevant).
+
 * This preference will be implemented by the use of Hints within EndpointSlices.
-* We already use Hints to implement `service.kubernetes.io/topology-mode: Auto`
-  In a similar manner, the EndpointSlice controller will now also populate hints
-  for `trafficDistribution: PreferClose` -- although in this case, the zone hint will
-  match the endpoint of the zone itself.
+  * We already use `Hints.ForZones` to implement
+    `service.kubernetes.io/topology-mode: Auto` In a similar manner, the
+    EndpointSlice controller will now also populate zone hints for
+    `trafficDistribution: PreferClose` -- although in this case, the zone hint will
+    match the endpoint of the zone itself.
+  * For the same-node preference, the EndpointSlice controller will set a new
+    `Hints.ForSameNode` field (to `true`) to indicate to the service proxy that
+    clients on the same node as this endpoint should prefer it. This will be set
+    when: 
+      * the Service has `PreferClose` traffic distribution, and
+      * the Service has endpoints on all or all-but-one of the Ready nodes, and
+      * the endpoints of the Service are Pods that have `OwnerReferences` indicating
+        that they are all part of the same DaemonSet.
+
 * While it may seem redundant to populate the hints here since kube-proxy can
   already derive the zone hint from the endpoints zone (as they would be the
   same), we will still use this for implementation simply because of the reason
@@ -362,6 +390,10 @@ NOTE: The expectation remains that *all* endpoints within an EndpointSlice must
   with partial hints. The reason for this requirement is the same one highlighted in [KEP-2433 Topology
   Aware
   Hints](https://github.com/kubernetes/enhancements/blob/master/keps/sig-network/2433-topology-aware-hints/README.md#kube-proxy), i.e. _"This is to provide safer transitions between enabled and disabled states. Without this fallback, endpoints could easily get overloaded as hints were being added or removed from some EndpointSlices but had not yet propagated to all of them."_
+
+Additionally, if a service has any endpoints for which (a) the `NodeName` is set to
+the name of kube-proxy's node, and (b) the `ForSameNode` hint is set, then kube-proxy
+will only send traffic for the service to those same-node endpoints.
 
 ### Choice of field name
 The name `trafficDistribution` is meant to capture the highly
